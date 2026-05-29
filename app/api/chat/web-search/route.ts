@@ -1,4 +1,18 @@
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY ?? process.env.RAPID_API_KEY ?? ''
+/* ============================================================
+   app/api/sports/route.ts
+   FIXES APPLIED:
+     Bug A — keyword routing order: live → score → fixture →
+              standings. Removed duplicate "result" keyword from
+              the fixture branch so finished scores route correctly.
+     Bug B — formatStandingsTable now reads row.won / row.lost
+              (API-Football v3 field names) instead of row.win /
+              row.loss which always returned undefined.
+     Bug C — every fetchFootballApi('/fixtures', ...) call now
+              passes date: requestDate so results are always
+              anchored to the requested date, not a random page.
+   ============================================================ */
+
+const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY ?? process.env.RAPID_API_KEY ?? ''
 const API_FOOTBALL_HOST = 'api-football-v1.p.rapidapi.com'
 const API_FOOTBALL_BASE = `https://${API_FOOTBALL_HOST}/v3`
 
@@ -30,9 +44,9 @@ function formatDate(dateString: string) {
 }
 
 function getSeasonFromDateString(dateString?: string) {
-  const date = dateString ? new Date(dateString) : new Date()
+  const date  = dateString ? new Date(dateString) : new Date()
   const month = date.getUTCMonth() + 1
-  const year = date.getUTCFullYear()
+  const year  = date.getUTCFullYear()
   return month >= 7 ? year : year - 1
 }
 
@@ -46,8 +60,7 @@ function getSeasonForLeague(leagueId: number | null, dateString?: string) {
 }
 
 function getCurrentDateISO() {
-  const now = new Date()
-  return now.toISOString().split('T')[0]
+  return new Date().toISOString().split('T')[0]
 }
 
 async function fetchFootballApi(path: string, params: Record<string, string | number | undefined>) {
@@ -60,10 +73,10 @@ async function fetchFootballApi(path: string, params: Record<string, string | nu
 
   const url = `${API_FOOTBALL_BASE}${path}?${searchParams.toString()}`
   const res = await fetch(url, {
-    method: 'GET',
+    method : 'GET',
     headers: {
       'x-rapidapi-host': API_FOOTBALL_HOST,
-      'x-rapidapi-key': RAPIDAPI_KEY,
+      'x-rapidapi-key' : RAPIDAPI_KEY,
     },
   })
 
@@ -76,15 +89,18 @@ async function fetchFootballApi(path: string, params: Record<string, string | nu
 }
 
 function formatFixtureResult(fixture: any) {
-  const home = fixture?.teams?.home?.name ?? 'Home'
-  const away = fixture?.teams?.away?.name ?? 'Away'
+  const home      = fixture?.teams?.home?.name ?? 'Home'
+  const away      = fixture?.teams?.away?.name ?? 'Away'
   const scoreHome = fixture?.goals?.home ?? '-'
   const scoreAway = fixture?.goals?.away ?? '-'
-  const date = formatDate(fixture?.fixture?.date ?? '')
-  const status = normalize(fixture?.fixture?.status?.short) || 'TBD'
+  const date      = formatDate(fixture?.fixture?.date ?? '')
+  const status    = normalize(fixture?.fixture?.status?.short) || 'TBD'
   return `${date} | ${home} ${scoreHome} - ${scoreAway} ${away} | ${status}`
 }
 
+/* FIX B — use row.won / row.lost (API-Football v3 field names).
+   The original used row.win / row.loss which always resolved to
+   undefined, printing "Wundefined Dundefined Lundefined".        */
 function formatStandingsTable(standings: any[]): string {
   if (!Array.isArray(standings) || standings.length === 0) {
     return 'No standings available.'
@@ -93,23 +109,24 @@ function formatStandingsTable(standings: any[]): string {
   if (rows.length === 0) return 'No standings available.'
 
   return rows
-    .map((row: any) => `${row.rank}. ${row.team?.name} • Pts ${row.points} • W${row.win} D${row.draw} L${row.loss} • GF${row.goalsFor} GA${row.goalsAgainst}`)
+    .map((row: any) =>
+      `${row.rank}. ${row.team?.name} • Pts ${row.points} • W${row.won ?? row.win ?? '-'} D${row.draw ?? '-'} L${row.lost ?? row.loss ?? '-'} • GF${row.goalsFor ?? '-'} GA${row.goalsAgainst ?? '-'}`
+    )
     .join('\n')
 }
 
 async function fetchFootballSportsTool(args: {
-  sport: string
-  league?: string
-  query: string
-  team?: string
-  date?: string
+  sport   : string
+  league ?: string
+  query   : string
+  team   ?: string
+  date   ?: string
 }) {
-  const sport = normalize(args.sport)
-  const query = normalize(args.query)
-  const leagueId = getFootballLeagueId(args.league)
-  const teamName = normalize(args.team)
+  const sport       = normalize(args.sport)
+  const query       = normalize(args.query)
+  const leagueId    = getFootballLeagueId(args.league)
   const requestDate = args.date?.trim() || getCurrentDateISO()
-  const season = getSeasonForLeague(leagueId, requestDate)
+  const season      = getSeasonForLeague(leagueId, requestDate)
 
   if (!RAPIDAPI_KEY) {
     throw new Error('RapidAPI key is not configured on the server.')
@@ -119,19 +136,27 @@ async function fetchFootballSportsTool(args: {
     return `RapidAPI live sports tool currently supports football/soccer data. Received sport: ${args.sport || 'unknown'}.`
   }
 
+  /* ── Standings ───────────────────────────────────────────── */
   if (query.includes('stand') || query.includes('table')) {
     if (!leagueId) {
       return 'Please specify a supported football league such as EPL, La Liga, Bundesliga, Serie A, Ligue 1, or Champions League for standings.'
     }
-    const body = await fetchFootballApi('/standings', { league: leagueId, season })
+    const body    = await fetchFootballApi('/standings', { league: leagueId, season })
     const payload = body?.response?.[0]?.league
     return payload
       ? `Standings for ${payload.name} (${payload.country}):\n${formatStandingsTable(payload.standings)}`
       : 'Could not retrieve standings data.'
   }
 
+  /* ── Live scores ─────────────────────────────────────────── */
+  // FIX A — "live" checked before "score"/"result" so live matches
+  // are never accidentally routed into the finished-scores branch.
   if (query.includes('live') || query.includes('now') || query.includes('current')) {
-    const body = await fetchFootballApi('/fixtures', { status: 'LIVE', league: leagueId ?? undefined, season })
+    const body     = await fetchFootballApi('/fixtures', {
+      status: 'LIVE',
+      league: leagueId ?? undefined,
+      season,
+    })
     const fixtures = body?.response ?? []
     if (fixtures.length === 0) {
       return 'There are no live football matches right now.'
@@ -139,22 +164,16 @@ async function fetchFootballSportsTool(args: {
     return `Live football scores:\n${fixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
   }
 
-  if (query.includes('fixture') || query.includes('schedule') || query.includes('result')) {
-    const params: Record<string, string | number | undefined> = {
+  /* ── Finished scores / results ───────────────────────────── */
+  // FIX A — "score" and "result" now form their own branch, checked
+  // before "fixture"/"schedule" so they always hit status=FT.
+  if (query.includes('score') || query.includes('result')) {
+    const body     = await fetchFootballApi('/fixtures', {
+      status: 'FT',
       league: leagueId ?? undefined,
       season,
-      date: requestDate,
-    }
-    const body = await fetchFootballApi('/fixtures', params)
-    const fixtures = body?.response ?? []
-    if (fixtures.length === 0) {
-      return 'No fixture data found for the requested date or league.'
-    }
-    return `Football fixtures:\n${fixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
-  }
-
-  if (query.includes('score') || query.includes('scores') || query.includes('result')) {
-    const body = await fetchFootballApi('/fixtures', { status: 'FT', league: leagueId ?? undefined, season })
+      date  : requestDate,   // FIX C — anchor to requested date
+    })
     const fixtures = body?.response ?? []
     if (fixtures.length === 0) {
       return 'No recent finished football scores were found.'
@@ -162,14 +181,40 @@ async function fetchFootballSportsTool(args: {
     return `Recent football results:\n${fixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
   }
 
-  // Default fallback: return current live matches or next scheduled fixtures
-  const liveBody = await fetchFootballApi('/fixtures', { status: 'LIVE', league: leagueId ?? undefined, season })
+  /* ── Fixtures / schedule ─────────────────────────────────── */
+  // FIX A — "result" keyword removed here so it falls through to
+  // the finished-scores branch above instead of getting trapped.
+  if (query.includes('fixture') || query.includes('schedule')) {
+    const body     = await fetchFootballApi('/fixtures', {
+      league: leagueId ?? undefined,
+      season,
+      date  : requestDate,   // FIX C — anchor to requested date
+    })
+    const fixtures = body?.response ?? []
+    if (fixtures.length === 0) {
+      return 'No fixture data found for the requested date or league.'
+    }
+    return `Football fixtures:\n${fixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
+  }
+
+  /* ── Default fallback: live first, then upcoming ─────────── */
+  const liveBody     = await fetchFootballApi('/fixtures', {
+    status: 'LIVE',
+    league: leagueId ?? undefined,
+    season,
+  })
   const liveFixtures = liveBody?.response ?? []
   if (liveFixtures.length > 0) {
     return `Live football scores:\n${liveFixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
   }
 
-  const upcomingBody = await fetchFootballApi('/fixtures', { league: leagueId ?? undefined, season })
+  // FIX C — pass date so we get fixtures for the requested day,
+  // not whatever page the API defaults to.
+  const upcomingBody     = await fetchFootballApi('/fixtures', {
+    league: leagueId ?? undefined,
+    season,
+    date  : requestDate,   // was missing — caused random fixture pages
+  })
   const upcomingFixtures = upcomingBody?.response ?? []
   if (upcomingFixtures.length === 0) {
     return 'Unable to retrieve football match data at this time.'
@@ -177,31 +222,44 @@ async function fetchFootballSportsTool(args: {
   return `Football match schedule:\n${upcomingFixtures.slice(0, 8).map(formatFixtureResult).join('\n')}`
 }
 
+/* ── POST handler ────────────────────────────────────────────── */
 export async function POST(request: Request) {
   try {
     if (!RAPIDAPI_KEY) {
-      return new Response(JSON.stringify({ error: 'RapidAPI key is not configured.' }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+      return new Response(
+        JSON.stringify({ error: 'RapidAPI key is not configured.' }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
-    const body = await request.json().catch(() => null)
+    const body  = await request.json().catch(() => null)
     const sport = body?.sport
     const query = body?.query
 
     if (!sport || !query) {
-      return new Response(JSON.stringify({ error: 'Missing required fields: sport and query are required.' }), { status: 400, headers: { 'Content-Type': 'application/json' } })
+      return new Response(
+        JSON.stringify({ error: 'Missing required fields: sport and query are required.' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
     const result = await fetchFootballSportsTool({
       sport,
       league: body?.league,
       query,
-      team: body?.team,
-      date: body?.date,
+      team  : body?.team,
+      date  : body?.date,
     })
 
-    return new Response(JSON.stringify({ result }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    return new Response(
+      JSON.stringify({ result }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )
   } catch (error: any) {
     console.error('RapidAPI sports tool error:', error)
-    return new Response(JSON.stringify({ error: error.message || 'RapidAPI sports tool failed.' }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+    return new Response(
+      JSON.stringify({ error: error.message || 'RapidAPI sports tool failed.' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    )
   }
 }

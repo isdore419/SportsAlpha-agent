@@ -964,7 +964,7 @@ function BalanceDrawer({
             ) : (
               <>
                 <div className="bamt">{bal.usdc}</div>
-                <div className="bsub">≈ ${bal.usdc} USD · live from Arc RPC</div>
+                <div className="bsub">≈ ${bal.usdc} USD</div>
                 <div className="bbt"><div className="bbf" style={{ width: '65%' }} /></div>
               </>
             )}
@@ -1059,7 +1059,6 @@ function Dashboard({ session, onSignOut }: { session: Session; onSignOut: () => 
 
   const feed = [
     { icon: '⚽', title: `${LEAGUE_TICKER[tickerIdx]} — Ask Sports Alpha AI`, meta: 'Live match analysis via Sports Alpha Engine', tag: 'live', tc: 'tlive' },
-    { icon: '📊', title: 'USDC Balance — Arc RPC Connected', meta: 'Real-time testnet data · Click 💼 to view', tag: 'rpc', tc: 'tnew' },
     { icon: '🤖', title: 'Sports Alpha AI Engine Active', meta: 'Ask scores, odds & analytics', tag: 'ai', tc: 'thot' },
   ]
 
@@ -1101,8 +1100,8 @@ function Dashboard({ session, onSignOut }: { session: Session; onSignOut: () => 
             <h1 className="gtit">{greeting},<br /><em>{session.username}</em>.</h1>
           </div>
           <div className="srow">
-            <div className="sc"><div className="slbl">Network</div><div className="sval g">ARC</div><div className="sdlt">Testnet · Live RPC</div></div>
-            <div className="sc"><div className="slbl">AI Engine</div><div className="sval">Alpha Core</div><div className="sdlt m">2.0 Flash · Ready</div></div>
+            <div className="sc"><div className="slbl">Network</div><div className="sval g">ARC</div></div>
+            <div className="sc"><div className="slbl">AI Engine</div><div className="sval">Alpha Core</div></div>
             <div className="sc"><div className="slbl">Messages</div><div className="sval">{messages.filter(m => m.role === 'user').length}</div><div className="sdlt m">this session</div></div>
           </div>
           {feed.map((item, i) => (

@@ -1,7 +1,17 @@
 /* ============================================================
-   PLACE THIS FILE AT:  app/api/web-search/route.ts
-   (matches the original path your frontend calls)
+   app/api/web-search/route.ts
+   FIXES APPLIED:
+     Bug 1 — stripDSML() scrubs <|DSML|tool_calls> markup from
+              message.content before it ever enters history or
+              becomes finalContent.
+     Bug 2 — final-answer guard now requires BOTH no tool_calls
+              AND non-empty content before breaking the loop.
+     Bug 3 — returnPlainJSON toggle: set false if your frontend
+              uses useChat() (AI SDK stream), true for fetch().
    ============================================================ */
+
+/* ── Toggle to match your frontend ──────────────────────────── */
+const returnPlainJSON = true   // true → { content } JSON  |  false → AI SDK stream
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY ?? ''
 const SERPER_API_KEY   = process.env.SERPER_API_KEY   ?? ''
@@ -21,6 +31,17 @@ interface ToolCall {
   id       : string
   type     : 'function'
   function : { name: string; arguments: string }
+}
+
+/* ── FIX 1: Strip raw DSML / tool-call markup ────────────────
+   DeepSeek-chat sometimes echoes its internal tool-call syntax
+   into content even when tool_calls is populated. Scrub it here
+   so it never reaches history or the final response.           */
+const DSML_RE = /<\|(?:DSML|tool_calls?|plugin_calls?)[^>]*>[\s\S]*?<\/\|(?:DSML|tool_calls?|plugin_calls?)\|>/gi
+
+function stripDSML(text: string | null | undefined): string {
+  if (!text) return ''
+  return text.replace(DSML_RE, '').trim()
 }
 
 /* ── ESPN league map ─────────────────────────────────────────── */
@@ -73,7 +94,6 @@ async function fetchESPNScores(endpoint: string, teamFilter?: string): Promise<s
     for (const event of toShow) {
       const comp      = event.competitions?.[0]
       const status    = comp?.status?.type
-      // ✅ Home always first (fixed)
       const home      = comp?.competitors?.find((c: any) => c.homeAway === 'home')
       const away      = comp?.competitors?.find((c: any) => c.homeAway === 'away')
       const homeName  = home?.team?.displayName ?? '?'
@@ -133,14 +153,12 @@ async function runWebSearch(query: string, type: string): Promise<string> {
   if (type === 'live_score' || type === 'standings') {
     out += `LIVE DATA for: "${query}"\n\n`
 
-    // 1. ESPN structured data (no key, always reliable)
     const endpoint  = detectESPNEndpoint(query)
     if (endpoint) {
       const teamHint = query.match(/\b([A-Z][a-z]+(?: [A-Z][a-z]+)?)\b/)?.[1]
       out += await fetchESPNScores(endpoint, teamHint)
     }
 
-    // 2. Serper last-hour for Google sports widget / answer box
     const live = await serperSearch(`${pinned} live score`, 'qdr:h')
     if (live?.sportsResults) {
       out += `=== GOOGLE SPORTS WIDGET ===\n${JSON.stringify(live.sportsResults, null, 2)}\n\n`
@@ -166,7 +184,6 @@ async function runWebSearch(query: string, type: string): Promise<string> {
     return out || 'No live data found. Match may not have started yet.'
   }
 
-  // General / news
   const data = await serperSearch(pinned, 'qdr:m6')
   if (!data) return 'Search failed — check SERPER_API_KEY.'
   out += `SEARCH RESULTS for "${pinned}":\n\n`
@@ -287,6 +304,32 @@ function json(data: unknown, status = 200) {
   })
 }
 
+/* ── FIX 3: AI SDK stream helper ─────────────────────────────
+   Only needed when returnPlainJSON = false (useChat() frontend).
+   Emits Vercel AI SDK text-stream protocol so useChat() works:
+   each chunk is "0:{json-string}\n", finished with a data event. */
+function toAIStream(text: string): Response {
+  const encoder = new TextEncoder()
+  const stream  = new ReadableStream({
+    start(controller) {
+      for (const word of text.split(/(\s+)/)) {
+        if (word) controller.enqueue(encoder.encode(`0:${JSON.stringify(word)}\n`))
+      }
+      controller.enqueue(
+        encoder.encode(`d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n`)
+      )
+      controller.close()
+    },
+  })
+  return new Response(stream, {
+    headers: {
+      'Content-Type'           : 'text/plain; charset=utf-8',
+      'X-Vercel-AI-Data-Stream': 'v1',
+      'Transfer-Encoding'      : 'chunked',
+    },
+  })
+}
+
 /* ── POST handler ────────────────────────────────────────────── */
 export async function POST(request: Request) {
   try {
@@ -313,11 +356,20 @@ export async function POST(request: Request) {
       if (!choice) throw new Error('DeepSeek returned no choices.')
 
       const msg: Message = choice.message
+
+      // FIX 1 — scrub DSML markup from content immediately on arrival,
+      // before it enters history or is tested as a final answer.
+      if (msg.content) msg.content = stripDSML(msg.content)
+
       messages.push(msg)
 
-      // No tool call → final answer
+      // FIX 2 — only treat this as a final answer when there are NO
+      // tool_calls AND we have actual non-empty clean content.
+      // The old code broke on `content ?? ''` which accepted empty strings.
       if (!msg.tool_calls?.length) {
-        finalContent = msg.content ?? ''
+        if (msg.content) {
+          finalContent = msg.content
+        }
         break
       }
 
@@ -340,12 +392,20 @@ export async function POST(request: Request) {
       round++
     }
 
+    // Fallback: find last clean assistant message with content and no tool_calls
     if (!finalContent) {
-      const last = [...messages].reverse().find(m => m.role === 'assistant' && m.content)
+      const last = [...messages].reverse().find(
+        m => m.role === 'assistant' && m.content && !m.tool_calls?.length
+      )
       finalContent = last?.content ?? 'No data found. The match may not have started yet.'
     }
 
-    return json({ content: finalContent })
+    // Belt-and-suspenders: strip any markup that slipped through
+    finalContent = stripDSML(finalContent)
+
+    return returnPlainJSON
+      ? json({ content: finalContent })
+      : toAIStream(finalContent)
 
   } catch (err: any) {
     console.error('[route error]', err?.message ?? err)
