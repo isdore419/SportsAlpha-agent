@@ -1,6 +1,13 @@
 // app/api/wallet/initialize-user/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 
+// ─── FIX: Use Circle's official ARC-TESTNET identifier ───────────────────────
+// Previously 'ETH-SEPOLIA' — which created wallets on Ethereum Sepolia, a
+// completely different chain from Arc Testnet (chainId 5042002).  Circle has
+// first-class support for Arc via the 'ARC-TESTNET' enum value, confirmed in
+// the Circle API reference: developers.circle.com/api-reference
+const ARC_BLOCKCHAIN = 'ARC-TESTNET'
+
 function parseWalletInfo(wallet: any) {
   if (!wallet) return { walletId: null, address: null }
   return {
@@ -137,8 +144,10 @@ export async function POST(req: NextRequest) {
       walletsData?.wallets ??
       []
 
+    // ─── FIX: Prefer ARC-TESTNET wallets; ignore wallets on other chains ─────
+    // Previously we just took walletsList[0] which could be an ETH-SEPOLIA wallet.
     const firstWallet = Array.isArray(walletsList) && walletsList.length > 0
-      ? walletsList[0]
+      ? (walletsList.find((w: any) => w?.blockchain === ARC_BLOCKCHAIN) ?? walletsList[0])
       : null
 
     if (firstWallet) {
@@ -173,8 +182,6 @@ export async function POST(req: NextRequest) {
 
       if (!createWalletResponse.ok) {
         // ── "Resource not found" means the user exists but hasn't run SDK init ──
-        // This is NOT a hard crash — we handle it gracefully by requesting a
-        // challengeId so the frontend can call sdk.execute() to complete PIN setup.
         const isResourceNotFound =
           createWalletData?.code === -1 ||
           (typeof createWalletData?.message === 'string' && (
@@ -189,7 +196,11 @@ export async function POST(req: NextRequest) {
             `Fetching challengeId for frontend sdk.execute() call.`
           )
 
-          // ── Request a challengeId from /user/initialize ──────────────────────
+          // ─── FIX: Pass ARC-TESTNET to /user/initialize ───────────────────────
+          // Previously: blockchains: ['ETH-SEPOLIA']
+          // This created wallets on Ethereum Sepolia — wrong chain entirely.
+          // Circle's /user/initialize uses this list to decide which chain
+          // the MPC wallet key material is bound to.
           let initChallengeId: string | null = null
           try {
             const initRes = await fetch('https://api.circle.com/v1/w3s/user/initialize', {
@@ -200,9 +211,9 @@ export async function POST(req: NextRequest) {
                 'X-User-Token': userToken,
               },
               body: JSON.stringify({
-                idempotencyKey: crypto.randomUUID(), // ✅ must be a valid UUID v4
+                idempotencyKey: crypto.randomUUID(),
                 accountType: 'SCA',
-                blockchains: ['ETH-SEPOLIA'],
+                blockchains: [ARC_BLOCKCHAIN], // ← FIX: was 'ETH-SEPOLIA'
               }),
             })
 
@@ -225,7 +236,6 @@ export async function POST(req: NextRequest) {
             console.warn('[initialize-user] Could not obtain init challengeId:', initErr?.message)
           }
 
-          // Return walletPending so frontend knows to call sdk.execute()
           return NextResponse.json({
             success: true,
             userToken,
@@ -237,13 +247,11 @@ export async function POST(req: NextRequest) {
           })
         }
 
-        // Any other wallet creation error is a genuine failure
         throw new Error(
           `Circle wallet creation failed: ${createWalletData?.message ?? JSON.stringify(createWalletData)}`
         )
       }
 
-      // Wallet created successfully — extract id and address
       const walletPayload =
         createWalletData?.data?.wallet ??
         createWalletData?.data ??

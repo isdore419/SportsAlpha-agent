@@ -1,6 +1,14 @@
 // app/api/circle/social-login/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 
+// ─── FIX: Circle's official identifier for Arc Testnet ───────────────────────
+// Previously hardcoded as 'ETH-SEPOLIA' inside the /user/initialize call.
+// That created wallets on Ethereum Sepolia (chainId 11155111), not Arc Testnet
+// (chainId 5042002).  All USDC transfers and balance checks were hitting the
+// wrong chain, which is why Circle returned no challengeId and the SDK threw
+// "invalid private key" when it couldn't find the key material for the chain.
+const ARC_BLOCKCHAIN = 'ARC-TESTNET'
+
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split('.')
@@ -110,8 +118,11 @@ async function lookupWallet(
     walletsData?.wallets ??
     []
 
+  // ─── FIX: Prefer ARC-TESTNET wallet; ignore wallets on other chains ─────────
+  // Previously: walletsList[0] — could grab an ETH-SEPOLIA wallet created before
+  // this fix, causing all operations to run on the wrong chain.
   const firstWallet = Array.isArray(walletsList) && walletsList.length > 0
-    ? walletsList[0]
+    ? (walletsList.find((w: any) => w?.blockchain === ARC_BLOCKCHAIN) ?? walletsList[0])
     : null
 
   if (!firstWallet) return { walletId: null, walletAddress: null }
@@ -271,7 +282,11 @@ export async function POST(req: NextRequest) {
             `Returning walletPending=true so frontend can call sdk.execute().`
           )
 
-          // Attempt to get an initialize challengeId for the frontend SDK
+          // ─── FIX: Pass ARC-TESTNET to /user/initialize ───────────────────────
+          // Previously: blockchains: ['ETH-SEPOLIA']
+          // Circle's /user/initialize binds the MPC key material to a specific chain.
+          // Using ETH-SEPOLIA here was creating wallets that couldn't interact with
+          // Arc Testnet USDC, causing every challengeId call to fail.
           let initChallengeId: string | null = null
           try {
             const initRes = await fetch('https://api.circle.com/v1/w3s/user/initialize', {
@@ -282,9 +297,9 @@ export async function POST(req: NextRequest) {
                 'X-User-Token': userToken,
               },
               body: JSON.stringify({
-                idempotencyKey: crypto.randomUUID(), // ✅ FIXED: proper UUID v4, not a custom string
+                idempotencyKey: crypto.randomUUID(),
                 accountType: 'SCA',
-                blockchains: ['ETH-SEPOLIA'],
+                blockchains: [ARC_BLOCKCHAIN], // ← FIX: was 'ETH-SEPOLIA'
               }),
             })
 

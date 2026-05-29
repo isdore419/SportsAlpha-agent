@@ -2,6 +2,47 @@
 
 Scores agent for NFL, NBA, NHL, and football
 
+## Architecture: Circle User-Controlled Wallets (MPC)
+
+SportsAlpha uses Circle's **User-Controlled (non-custodial) MPC wallets**. Each
+user owns their own keys — the server never holds or sees a private key, no
+`ENTITY_SECRET` is involved, and no developer-managed custody exists.
+
+All transaction signing goes through Circle's SDK running in the browser:
+
+1. **User logs in** via Google OAuth → backend creates (or retrieves) their
+   Circle user account and returns a `userToken` + `encryptionKey`
+2. **Backend** calls Circle's API to create a `challengeId` for the requested
+   action (wallet initialization or USDC transfer)
+3. **Frontend** calls `sdk.execute(challengeId, callback)` — Circle's SDK
+   presents the PIN/passcode modal directly to the user
+4. Circle's MPC network co-signs and broadcasts the transaction
+
+```
+Browser                     Your Backend              Circle API
+──────────────────────────────────────────────────────────────────
+User clicks "Send USDC"
+    │
+    ├─── POST /api/circle/create-transfer-challenge ──►
+    │                                                  Creates challenge
+    │◄── { challengeId } ─────────────────────────────────────────
+    │
+    │  sdk.execute(challengeId)
+    │  ┌─────────────────────────┐
+    │  │  Circle PIN Modal (SDK) │  ◄── user enters their PIN
+    │  └─────────────────────────┘
+    │        PIN confirmed
+    │
+    └──────────────────────────────────────────────► Circle co-signs
+                                                     & broadcasts tx
+```
+
+**What the server never touches:** user private keys, PIN, passcode, or any
+signing material. The `CIRCLE_API_KEY` is used only to create users, fetch
+wallet metadata, and generate challenge IDs — not to sign anything.
+
+---
+
 ## Quick Start
 
 ### 1. Install dependencies
@@ -12,35 +53,56 @@ npm install
 
 ### 2. Configure environment
 
-Edit `.env` and add your API keys:
+Copy `.env.example` to `.env` and fill in your keys:
 
 ```env
-# Already set if wallet was auto-generated
-PRIVATE_KEY=your_private_key
+# ── Circle (required) ────────────────────────────────────────────────────
+# Get from https://console.circle.com → Programmable Wallets → User-Controlled
+CIRCLE_API_KEY=your_circle_api_key
+NEXT_PUBLIC_CIRCLE_APP_ID=your_circle_app_id
 
+# ── Google OAuth (required for Google sign-in) ───────────────────────────
+NEXT_PUBLIC_GOOGLE_CLIENT_ID=your_google_client_id
+
+# ── Pinata IPFS (required for agent registration) ────────────────────────
 # Get from https://pinata.cloud (free tier works)
 PINATA_JWT=your_pinata_jwt
 
-# Get from https://platform.openai.com
+# ── OpenAI (required for AI chat) ────────────────────────────────────────
 OPENAI_API_KEY=your_openai_key
+
+# ── x402 payment (set to your Circle MPC wallet address) ─────────────────
+NEXT_PUBLIC_X402_PAYEE_ADDRESS=0x...your_circle_wallet_address...
+NEXT_PUBLIC_X402_PRICE=0.001
+
 ```
 
-### 3. Fund your wallet
+**Keys this project does NOT use:**
+- No `ENTITY_SECRET` — that is for Circle Developer-Controlled Wallets only.
+  SportsAlpha uses User-Controlled Wallets; users hold their own keys.
+- No `PRIVATE_KEY` / `DEPLOYER_PRIVATE_KEY` — all runtime signing is done by
+  users via the Circle SDK. On-chain registration can be performed with an
+  external wallet tool (Foundry, Hardhat, or a browser wallet).
 
-Your agent wallet: `0xaCB5b32D83c9182a012334c3CC0775098AE1f927`
+### 3. Fund your receiving wallet
 
-Get testnet tokens from: https://www.coinbase.com/faucets/base-ethereum-goerli-faucet
+Get testnet tokens for the address in `NEXT_PUBLIC_X402_PAYEE_ADDRESS` from:
+https://www.coinbase.com/faucets/base-ethereum-goerli-faucet
 
-
-### 4. Register on-chain
+### 4. Register on-chain (one-time)
 
 ```bash
 npm run register
 ```
 
+This registers the agent in the ERC-8004 on-chain registry. No local private
+key is required — the script uses the Agent0 SDK in metadata-only mode. If the
+SDK requires a signer, use an external wallet tool (e.g., Foundry `cast`) to
+submit the registration transaction.
+
 This will:
-- Upload your agent metadata to IPFS
-- Register your agent on Base Sepolia (Testnet)
+- Upload your agent metadata to IPFS via Pinata
+- Register your agent on Arc Testnet (ERC-8004)
 - Output your agent ID and 8004scan link
 
 ### 5. Start the A2A server
@@ -53,7 +115,7 @@ Test locally: http://localhost:3000/.well-known/agent-card.json
 
 #### Test your agent
 
-\`\`\`bash
+```bash
 # Discover agent capabilities
 npm run a2a:discover
 
@@ -62,7 +124,7 @@ npm run a2a:chat
 
 # Run automated tests
 npm run a2a:test
-\`\`\`
+```
 
 ### 6. Start the MCP server
 
@@ -70,63 +132,91 @@ npm run a2a:test
 npm run start:mcp
 ```
 
+---
+
 ## Project Structure
 
 ```
 sportsalpha/
 ├── src/
-│   ├── register.ts      # Registration script
-│   ├── agent.ts         # LLM logic
-│   ├── a2a-server.ts   # A2A server
-│   └── a2a-client.ts   # A2A testing client
-│   └── mcp-server.ts   # MCP server
-├── .env                 # Environment variables (keep secret!)
-└── package.json
+│   ├── register.ts      # One-time on-chain registration (no private key needed)
+│   ├── agent.ts         # LLM logic (OpenAI)
+│   ├── a2a-server.ts    # A2A server (x402 payment middleware)
+│   ├── a2a-client.ts    # A2A testing client
+│   ├── mcp-server.ts    # MCP server (stdio)
+│   └── tools.ts         # MCP tool definitions
+├── app/
+│   └── page.tsx         # Next.js frontend (Circle User-Controlled Wallets)
+└── .env                 # Environment variables (keep secret!)
 ```
+
+---
+
+## User Wallet Flow — Key API Routes
+
+| Route | Purpose |
+|---|---|
+| `POST /api/wallet/initialize-user` | Create Circle user + return `challengeId` for PIN setup |
+| `POST /api/circle/social-login` | Google OAuth → Circle user token + wallet lookup |
+| `POST /api/circle/wallet-address` | Resolve wallet address from `walletId` or `userId` |
+| `POST /api/circle/create-transfer-challenge` | Create USDC transfer challenge → `challengeId` |
+
+All routes return a `challengeId`. The frontend calls `sdk.execute(challengeId)`
+which opens the Circle PIN modal in the browser. Circle's MPC network handles
+co-signing and broadcasting. **No private key ever reaches the server.**
+
+### First-time user flow
+
+1. User signs in with Google → `/api/circle/social-login` creates their Circle
+   account (idempotent) and looks up any existing wallet
+2. If no wallet exists yet, the backend calls `/user/initialize` to get an
+   `initChallengeId` and returns `walletPending: true`
+3. Frontend calls `sdk.execute(initChallengeId)` → user sets their PIN
+4. Circle creates the MPC wallet; frontend polls `/api/circle/wallet-address`
+   until the address is available
+
+---
 
 ## x402 Payments
 
-This agent has x402 payment support enabled. Protected endpoints require USDC payment.
+Protected endpoints require a small USDC payment per request. The payment uses
+the same Circle SDK challenge flow — the user sees a PIN confirmation modal
+before each fee is deducted from their wallet.
 
-Payment configuration in `.env`:
-- `X402_PAYEE_ADDRESS` - Wallet to receive payments
-- `X402_PRICE` - Price per request (e.g., $0.001)
+```env
+NEXT_PUBLIC_X402_PAYEE_ADDRESS=0x...  # wallet that receives fees
+NEXT_PUBLIC_X402_PRICE=0.001          # price per request in USDC
+```
+
+---
 
 ## OASF Skills & Domains (Optional)
 
-Add capabilities and domain expertise to help others discover your agent.
-
-Edit `src/register.ts` and uncomment/add before `registerIPFS()`:
+Edit `src/register.ts` and add before `registerIPFS()`:
 
 ```typescript
-// Add skills (what your agent can do)
 agent.addSkill('natural_language_processing/natural_language_generation/summarization');
-agent.addSkill('analytical_skills/coding_skills/text_to_code');
-
-// Add domains (areas of expertise)  
 agent.addDomain('technology/software_engineering');
-agent.addDomain('finance_and_business/investment_services');
 ```
 
 Browse the full taxonomy: https://schema.oasf.outshift.com/0.8.0
 
+---
+
 ## Going Live
 
-By default, your agent is registered with `active: false`. This is intentional - it lets you test without appearing in explorer listings.
+1. Update `AGENT_CONFIG` endpoint URLs in `src/register.ts` to your production domain
+2. Re-run `npm run register`
+3. Deploy to Vercel, Railway, or your preferred host
+4. Ensure `CIRCLE_API_KEY`, `NEXT_PUBLIC_CIRCLE_APP_ID`, and `NEXT_PUBLIC_GOOGLE_CLIENT_ID`
+   are set in your production environment
 
-When you're ready for production:
-1. Edit `src/register.ts` and change `agent.setActive(false)` to `agent.setActive(true)`
-2. Re-run `npm run register` to update your agent's metadata
-
-## Next Steps
-
-1. Update the endpoint URLs in `src/register.ts` with your production domain
-2. Customize the agent logic in `src/agent.ts`
-3. Deploy to a cloud provider (Vercel, Railway, etc.)
-4. Re-run `npm run register` if you change metadata
+---
 
 ## Resources
 
+- [Circle User-Controlled Wallets](https://developers.circle.com/w3s/user-controlled-wallets-overview)
+- [Circle Programmable Wallets Overview](https://developers.circle.com/w3s/programmable-wallets-overview)
 - [ERC-8004 Standard](https://eips.ethereum.org/EIPS/eip-8004)
 - [8004scan Explorer](https://www.8004scan.io/)
 - [Agent0 SDK Docs](https://sdk.ag0.xyz/)

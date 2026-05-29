@@ -106,7 +106,7 @@ class A2AClient {
    * Send a message to the agent
    * Returns a Task object with status and response
    */
-  async send(text: string, userId?: string, options?: {
+  async send(text: string, options?: {
     contextId?: string;
     streaming?: boolean;
   }): Promise<Task> {
@@ -131,13 +131,13 @@ class A2AClient {
     log('Sending request', payload);
 
     if (options?.streaming) {
-      return this.handleStreaming(payload, userId);
+      return this.handleStreaming(payload);
     }
 
     const response = await fetch(`${this.baseUrl}/a2a`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...payload, userId }),
+      body: JSON.stringify(payload),
     });
 
     if (response.status === 402) {
@@ -161,11 +161,11 @@ class A2AClient {
   /**
    * Handle SSE streaming response
    */
-  private async handleStreaming(payload: object, userId?: string): Promise<Task> {
+  private async handleStreaming(payload: object): Promise<Task> {
     const response = await fetch(`${this.baseUrl}/a2a`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...payload, userId }),
+      body: JSON.stringify(payload),
     });
 
     if (response.status === 402) {
@@ -203,8 +203,10 @@ class A2AClient {
                 process.stdout.write(`\rAgent: ${agentMsg.parts[0].text}`);
               }
             }
-          } catch {
-            // Ignore parse errors for partial chunks
+          } catch (e) {
+            // Only swallow JSON parse errors for partial/incomplete SSE chunks.
+            // Any other error (TypeError, RangeError, etc.) is a real problem.
+            if (!(e instanceof SyntaxError)) throw e;
           }
         }
       }
@@ -280,8 +282,8 @@ class A2AClient {
                 }
               }
             }
-          } catch {
-            // Ignore parse errors
+          } catch (e) {
+            if (!(e instanceof SyntaxError)) throw e;
           }
         }
       }
@@ -295,7 +297,7 @@ class A2AClient {
     if (!this.currentContextId) {
       throw new Error('No active conversation. Call send() first.');
     }
-    return this.send(text, undefined, { contextId: this.currentContextId, streaming });
+    return this.send(text, { contextId: this.currentContextId, streaming });
   }
 
   /**

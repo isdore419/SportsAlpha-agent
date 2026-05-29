@@ -15,13 +15,12 @@
   ║  NEXT_PUBLIC_X402_PAYEE_ADDRESS=0x...receiver...            ║
   ║                                                             ║
   ║  REQUIRED packages:                                         ║
-  ║  npm install ethers @circle-fin/w3s-pw-web-sdk              ║
+  ║  npm install @circle-fin/w3s-pw-web-sdk                     ║
   ╚══════════════════════════════════════════════════════════════╝
 */
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { ethers } from 'ethers'
 import { W3SSdk } from '@circle-fin/w3s-pw-web-sdk'
 
 /* ─────────────────────────────────────────────────────────────
@@ -39,14 +38,17 @@ const _USDC_RAW = (
   process.env.NEXT_PUBLIC_USDC_CONTRACT ?? '0x3600000000000000000000000000000000000000'
 ).trim()
 let USDC_ADDR: string = _USDC_RAW
-try { USDC_ADDR = ethers.getAddress(_USDC_RAW) } catch { /* keep raw if checksum fails */ }
+// Address stored as-is; validated at call sites with isEvmAddress()
 
 const PROMPT_FEE_AMOUNT = (process.env.NEXT_PUBLIC_X402_PRICE        ?? '0.001').trim()
 const RECEIVER_ADDRESS  = (process.env.NEXT_PUBLIC_X402_PAYEE_ADDRESS ?? '').trim()
 
-const CIRCLE_WEB_CLIENT_ID = process.env.NEXT_PUBLIC_CIRCLE_WEB_CLIENT_ID ?? ''
-const CIRCLE_APP_ID        = process.env.NEXT_PUBLIC_CIRCLE_APP_ID ?? 'f058d6a4-52d2-528a-b48f-38a619ba82e2'
-const GOOGLE_CLIENT_ID     = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? CIRCLE_WEB_CLIENT_ID ?? '665078515834-otn3ls8l6b2pil9i1a9igdlb6mfmdgfg.apps.googleusercontent.com'
+const CIRCLE_WEB_CLIENT_ID = (process.env.NEXT_PUBLIC_CIRCLE_WEB_CLIENT_ID ?? '').trim()
+// FIX: .trim() prevents trailing-space in .env from breaking Circle SDK init on Vercel.
+// A space after the env value causes Circle SDK to receive the appId with a trailing space,
+// which it rejects internally with a cryptic "invalid private key" error.
+const CIRCLE_APP_ID        = (process.env.NEXT_PUBLIC_CIRCLE_APP_ID ?? 'f058d6a4-52d2-528a-b48f-38a619ba82e2').trim()
+const GOOGLE_CLIENT_ID     = (process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? CIRCLE_WEB_CLIENT_ID ?? '665078515834-otn3ls8l6b2pil9i1a9igdlb6mfmdgfg.apps.googleusercontent.com').trim()
 
 /* ─────────────────────────────────────────────────────────────
    CIRCLE SDK  — module-level singleton
@@ -66,7 +68,6 @@ interface StoredUser {
   username: string
   passwordHash: string
   walletAddress: string
-  privateKey: string
   walletId?: string
   circleUserToken?: string
   circleEncryptionKey?: string
@@ -75,7 +76,6 @@ interface Session {
   username: string
   email: string
   walletAddress: string
-  privateKey: string
   walletId?: string
   circleUserToken?: string
   circleEncryptionKey?: string
@@ -114,6 +114,14 @@ function simpleHash(s: string): string {
 }
 
 /* ─────────────────────────────────────────────────────────────
+   ADDRESS HELPERS  (replaces ethers.getAddress / isAddress)
+───────────────────────────────────────────────────────────── */
+/** Lightweight EVM address validator — no ethers dependency required. */
+function isEvmAddress(addr: string): boolean {
+  return typeof addr === 'string' && /^0x[0-9a-fA-F]{40}$/.test(addr)
+}
+
+/* ─────────────────────────────────────────────────────────────
    ARC NETWORK RPC
 ───────────────────────────────────────────────────────────── */
 async function arcRPC(method: string, params: unknown[]): Promise<unknown> {
@@ -143,8 +151,7 @@ async function arcRPC(method: string, params: unknown[]): Promise<unknown> {
 async function fetchUSDCBalance(address: string): Promise<string> {
   const isZeroContract = !USDC_ADDR || USDC_ADDR.replace(/0/g, '').replace('x', '') === ''
   if (isZeroContract) return '0.00'
-  let checksumAddr: string
-  try { checksumAddr = ethers.getAddress(address) } catch { checksumAddr = address }
+  const checksumAddr = address  // address already validated by isEvmAddress() at call sites
   const data = '0x70a08231' + checksumAddr.replace(/^0x/i, '').padStart(64, '0')
   let raw: string
   try {
@@ -161,8 +168,7 @@ async function fetchUSDCBalance(address: string): Promise<string> {
 }
 
 async function fetchNativeBalance(address: string): Promise<string> {
-  let checksumAddr: string
-  try { checksumAddr = ethers.getAddress(address) } catch { checksumAddr = address }
+  const checksumAddr = address  // validated upstream
   const raw = (await arcRPC('eth_getBalance', [checksumAddr, 'latest'])) as string
   if (!raw || raw === '0x') return '0.0000'
   const wei = BigInt(raw)
@@ -171,38 +177,41 @@ async function fetchNativeBalance(address: string): Promise<string> {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   SEND USDC
+   SEND USDC  (Circle MPC — no private key on client)
 ───────────────────────────────────────────────────────────── */
-async function sendUSDC(privateKey: string, toAddress: string, amount: string): Promise<string> {
-  let lastErr: Error = new Error('sendUSDC: all RPC endpoints failed')
-  for (const rpcUrl of ARC_RPC_URLS) {
-    try {
-      const provider = new ethers.JsonRpcProvider(
-        rpcUrl,
-        { chainId: ARC_CHAIN_ID, name: 'arc-testnet' },
-        { staticNetwork: true }
-      )
-      const wallet = new ethers.Wallet(privateKey, provider)
-      const erc20  = new ethers.Contract(
-        USDC_ADDR,
-        [
-          'function transfer(address to, uint256 amount) returns (bool)',
-          'function decimals() view returns (uint8)',
-        ],
-        wallet
-      )
-      let decimals = 6
-      try { decimals = Number(await erc20.decimals()) } catch {}
-      const amountWei = ethers.parseUnits(amount, decimals)
-      const tx = await erc20.transfer(toAddress, amountWei)
-      await tx.wait(1)
-      return tx.hash as string
-    } catch (e: any) {
-      console.warn(`[sendUSDC] ${rpcUrl} failed:`, e?.message)
-      lastErr = e instanceof Error ? e : new Error(String(e))
-    }
+// All USDC transfers now go through the Circle Challenge flow:
+// backend creates a transferChallenge → sdk.execute() shows PIN modal
+// → Circle co-signs and broadcasts. No private key ever touches the
+// browser. See deductPromptFee() and SendModal for the implementation.
+
+/* ─────────────────────────────────────────────────────────────
+   TOKEN REFRESH HELPER  (module-level, no React state needed)
+───────────────────────────────────────────────────────────── */
+
+/**
+ * Fetch fresh userToken + encryptionKey from Circle without requiring a
+ * full re-login.  Circle session tokens expire (typically ~1 h), so any
+ * long-lived session will hit this.  We call initialize-user which is
+ * fully idempotent — it never re-creates the user or wallet.
+ */
+async function refreshCircleTokens(
+  email: string
+): Promise<{ userToken: string; encryptionKey: string } | null> {
+  try {
+    const res = await fetch('/api/wallet/initialize-user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    const userToken     = typeof data?.userToken     === 'string' ? data.userToken     : null
+    const encryptionKey = typeof data?.encryptionKey === 'string' ? data.encryptionKey : null
+    if (!userToken || !encryptionKey) return null
+    return { userToken, encryptionKey }
+  } catch {
+    return null
   }
-  throw lastErr
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -213,45 +222,100 @@ async function deductPromptFee(session: Session): Promise<string> {
     console.warn('[PromptFee] NEXT_PUBLIC_X402_PAYEE_ADDRESS not set — fee skipped.')
     return 'skipped'
   }
-  let checksumReceiver: string
-  try {
-    checksumReceiver = ethers.getAddress(RECEIVER_ADDRESS)
-  } catch {
-    throw new Error(`[PromptFee] Invalid payee address: "${RECEIVER_ADDRESS}"`)
+  if (!isEvmAddress(RECEIVER_ADDRESS)) {
+    throw new Error(`[PromptFee] Invalid payee address: "${RECEIVER_ADDRESS}". Check NEXT_PUBLIC_X402_PAYEE_ADDRESS.`)
   }
-  if (session.privateKey) {
-    return await sendUSDC(session.privateKey, checksumReceiver, PROMPT_FEE_AMOUNT)
+
+  if (!session.circleUserToken || !session.circleEncryptionKey || !session.walletId) {
+    throw new Error('Wallet not initialised — please sign out and sign back in.')
   }
-  if (session.circleUserToken && session.circleEncryptionKey && session.walletId) {
-    const sdk = getCircleSDK()
-    sdk.setAuthentication({
-      userToken:     session.circleUserToken,
-      encryptionKey: session.circleEncryptionKey,
-    })
-    const challengeRes = await fetch('/api/circle/create-transfer-challenge', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userToken:       session.circleUserToken,
-        walletId:        session.walletId,
-        toAddress:       checksumReceiver,
-        amount:          PROMPT_FEE_AMOUNT,
-        contractAddress: USDC_ADDR,
-      }),
-    })
-    if (!challengeRes.ok) {
-      const errBody = await challengeRes.json().catch(() => ({}))
-      throw new Error((errBody as any)?.error ?? 'Failed to create Circle transfer challenge')
+
+  // ── FIX: Refresh tokens before every fee deduction ───────────────────────
+  // Circle session tokens expire (typically ~1 h). If we use a stale token,
+  // Circle returns an auth error and we get "No challengeId returned" or
+  // the Circle SDK throws "invalid private key" internally (ethers error).
+  // Refreshing proactively on each message costs one cheap backend call but
+  // completely eliminates the stale-token class of errors.
+  let activeUserToken     = session.circleUserToken
+  let activeEncryptionKey = session.circleEncryptionKey
+
+  if (session.email) {
+    const refreshed = await refreshCircleTokens(session.email)
+    if (refreshed) {
+      activeUserToken     = refreshed.userToken
+      activeEncryptionKey = refreshed.encryptionKey
+      // Persist fresh tokens to localStorage so the session survives the next
+      // page refresh without immediately expiring again.
+      try {
+        const stored = localStorage.getItem('sa_session')
+        if (stored) {
+          const parsed = JSON.parse(stored)
+          localStorage.setItem('sa_session', JSON.stringify({
+            ...parsed,
+            circleUserToken:     activeUserToken,
+            circleEncryptionKey: activeEncryptionKey,
+          }))
+        }
+      } catch { /* non-critical */ }
     }
-    const { challengeId } = await challengeRes.json()
-    return new Promise<string>((resolve, reject) => {
-      sdk.execute(challengeId, (err: any, result: any) => {
-        if (err) reject(new Error(err?.message ?? 'Circle challenge execution failed'))
-        else resolve(result?.data?.signature ?? challengeId)
-      })
-    })
   }
-  throw new Error('[PromptFee] No signing method available — please sign in again.')
+
+  const sdk = getCircleSDK()
+  sdk.setAuthentication({
+    userToken:     activeUserToken,
+    encryptionKey: activeEncryptionKey,
+  })
+
+  const challengeRes = await fetch('/api/circle/create-transfer-challenge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userToken:       activeUserToken,
+      walletId:        session.walletId,
+      toAddress:       RECEIVER_ADDRESS,
+      amount:          PROMPT_FEE_AMOUNT,
+      contractAddress: USDC_ADDR,
+    }),
+  })
+
+  if (!challengeRes.ok) {
+    const errBody = await challengeRes.json().catch(() => ({}))
+    const msg = (errBody as any)?.error ?? 'Failed to create Circle transfer challenge'
+    // ── FIX: Detect the most common actionable failure modes ─────────────────
+    if (msg.toLowerCase().includes('session expired') || msg.toLowerCase().includes('unauthorized')) {
+      throw new Error('Session expired — please sign out and sign back in.')
+    }
+    throw new Error(msg)
+  }
+
+  const body = await challengeRes.json()
+  const { challengeId } = body
+
+  if (!challengeId) {
+    throw new Error('No challengeId returned from Circle — check your USDC balance on Arc Testnet.')
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    sdk.execute(challengeId, (err: any, result: any) => {
+      if (err) {
+        // ── FIX: Translate SDK internal errors into actionable messages ────────
+        // The Circle SDK uses ethers internally.  When key material is missing or
+        // the chain doesn't match, ethers throws "invalid private key".  After the
+        // backend fix (ARC-TESTNET wallet creation), this should not occur for new
+        // wallets.  For users who signed up before the fix, they must sign out and
+        // back in to re-initialize their wallet on the correct chain.
+        const raw = err?.message ?? 'Circle challenge execution failed'
+        const isKeyError = raw.toLowerCase().includes('private key') || raw.toLowerCase().includes('invalid argument')
+        if (isKeyError) {
+          reject(new Error('Wallet key error — your wallet may be on the wrong chain. Please sign out and sign back in to re-initialize on Arc Testnet.'))
+        } else {
+          reject(new Error(raw))
+        }
+      } else {
+        resolve(result?.data?.signature ?? challengeId)
+      }
+    })
+  })
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -641,15 +705,84 @@ function SendModal({ session, onClose }: { session: Session; onClose: () => void
 
   const handleSend = async () => {
     setErr(''); setTxHash('')
-    if (!ethers.isAddress(toAddr)) { setErr('Invalid recipient address.'); return }
+    if (!isEvmAddress(toAddr)) { setErr('Invalid recipient address.'); return }
     const amt = parseFloat(amount)
     if (isNaN(amt) || amt <= 0) { setErr('Enter a valid amount greater than 0.'); return }
     const isZeroContract = !USDC_ADDR || USDC_ADDR.replace(/0/g, '').replace('x', '').length === 0
     if (isZeroContract) { setErr('USDC contract not configured. Add NEXT_PUBLIC_USDC_CONTRACT to .env.local'); return }
     setLoading(true)
     try {
-      const hash = await sendUSDC(session.privateKey, toAddr, amount)
-      setTxHash(hash)
+      if (!session.circleUserToken || !session.circleEncryptionKey || !session.walletId) {
+        setErr('Wallet not fully initialised. Please sign out and back in.')
+        return
+      }
+
+      // ── FIX: Refresh tokens before sending ─────────────────────────────────
+      // Stale tokens cause the Circle SDK to throw "invalid private key"
+      // (an internal ethers error).  Refreshing before each send call
+      // ensures we always use a valid, non-expired session.
+      let activeUserToken     = session.circleUserToken
+      let activeEncryptionKey = session.circleEncryptionKey
+
+      if (session.email) {
+        const refreshed = await refreshCircleTokens(session.email)
+        if (refreshed) {
+          activeUserToken     = refreshed.userToken
+          activeEncryptionKey = refreshed.encryptionKey
+          // Persist to localStorage so future sends also use fresh tokens
+          try {
+            const stored = localStorage.getItem('sa_session')
+            if (stored) {
+              const parsed = JSON.parse(stored)
+              localStorage.setItem('sa_session', JSON.stringify({
+                ...parsed,
+                circleUserToken:     activeUserToken,
+                circleEncryptionKey: activeEncryptionKey,
+              }))
+            }
+          } catch { /* non-critical */ }
+        }
+      }
+
+      const sdk = getCircleSDK()
+      sdk.setAuthentication({ userToken: activeUserToken, encryptionKey: activeEncryptionKey })
+
+      const challengeRes = await fetch('/api/circle/create-transfer-challenge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userToken:       activeUserToken,
+          walletId:        session.walletId,
+          toAddress:       toAddr,
+          amount,
+          contractAddress: USDC_ADDR,
+        }),
+      })
+
+      if (!challengeRes.ok) {
+        const errBody = await challengeRes.json().catch(() => ({}))
+        throw new Error((errBody as any)?.error ?? 'Failed to create Circle transfer challenge')
+      }
+
+      const raw = await challengeRes.json()
+      const { challengeId } = { ...raw } as { challengeId: string }
+
+      const txRef = await new Promise<string>((resolve, reject) => {
+        sdk.execute(challengeId, (err: any, result: any) => {
+          if (err) {
+            const raw = err?.message ?? 'Circle challenge execution failed'
+            const isKeyError = raw.toLowerCase().includes('private key') || raw.toLowerCase().includes('invalid argument')
+            if (isKeyError) {
+              reject(new Error('Wallet key error — please sign out and sign back in to re-initialize on Arc Testnet.'))
+            } else {
+              reject(new Error(raw))
+            }
+          } else {
+            resolve(result?.data?.txHash ?? result?.data?.signature ?? challengeId)
+          }
+        })
+      })
+      setTxHash(txRef)
     } catch (e: any) {
       setErr(e?.message ?? 'Transaction failed.')
     } finally {
@@ -1267,8 +1400,7 @@ export default function Home() {
           username:            name,
           email:               email || '',
           walletAddress:       finalWalletAddress,
-          privateKey:          '',
-          walletId:            finalWalletId ?? undefined,
+            walletId:            finalWalletId ?? undefined,
           circleUserToken:     circleResult.userToken,
           circleEncryptionKey: circleResult.encryptionKey,
         }
@@ -1277,8 +1409,7 @@ export default function Home() {
           username:            name,
           passwordHash:        '',
           walletAddress:       finalWalletAddress,
-          privateKey:          '',
-          walletId:            finalWalletId ?? undefined,
+            walletId:            finalWalletId ?? undefined,
           circleUserToken:     circleResult.userToken,
           circleEncryptionKey: circleResult.encryptionKey,
         }
@@ -1312,8 +1443,7 @@ export default function Home() {
           username:            name,
           email:               email || '',
           walletAddress:       finalWalletAddress,
-          privateKey:          '',
-          walletId:            finalWalletId ?? undefined,
+            walletId:            finalWalletId ?? undefined,
           circleUserToken:     circleResult.userToken,
           circleEncryptionKey: circleResult.encryptionKey,
         }
@@ -1539,7 +1669,6 @@ export default function Home() {
         username,
         email,
         walletAddress,
-        privateKey:          '',
         walletId,
         circleUserToken:     userToken,
         circleEncryptionKey: encryptionKey,
@@ -1548,7 +1677,6 @@ export default function Home() {
         username,
         passwordHash:        simpleHash(password),
         walletAddress:       sess.walletAddress,
-        privateKey:          sess.privateKey,
         walletId:            sess.walletId,
         circleUserToken:     sess.circleUserToken,
         circleEncryptionKey: sess.circleEncryptionKey,
@@ -1580,7 +1708,6 @@ export default function Home() {
       username:            user.username,
       email,
       walletAddress:       user.walletAddress,
-      privateKey:          user.privateKey,
       walletId:            user.walletId,
       circleUserToken:     user.circleUserToken,
       circleEncryptionKey: user.circleEncryptionKey,
